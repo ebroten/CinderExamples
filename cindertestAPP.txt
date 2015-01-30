@@ -1,0 +1,293 @@
+#include "cinder/app/AppBasic.h"
+#include "cinder/Camera.h"
+#include "cinder/Channel.h"
+#include "cinder/audio/Input.h"
+#include "cinder/audio/FftProcessor.h"
+#include "cinder/gl/gl.h"
+#include "cinder/gl/Texture.h"
+#include "cinderSyphon.h"
+
+using namespace ci;
+using namespace ci::app;
+using namespace std;
+
+class cindertestApp
+	: public AppBasic
+{
+public:
+    void prepareSettings(Settings *settings);
+	void setup();
+	void mouseDown(MouseEvent event);	
+	void update();
+    void quadraticFftAverage();
+    void logarithmicFftAverage();
+	void draw();
+    void drawRing(int channel);
+
+private:    
+    CameraPersp mCam;
+    
+    audio::Input mInput;
+    audio::PcmBuffer32fRef mPcmBuffer;
+
+    struct FftDataChannels {
+        shared_ptr<float> left;
+        shared_ptr<float> right;
+    } mFftDataRef;
+    int mBandCount;
+    
+    struct AveragedFftDataChannels {
+        vector<float> left;
+        vector<float> right;
+    } mAveragedFft;
+    enum FftAverageMode {
+		fftQuadraticAverage,
+		fftLogarithmicAverage
+	} mFftAverageMode;
+
+    gl::Texture mWaveformTexture;
+
+	syphonServer mSyphonServer;
+};
+
+void cindertestApp::prepareSettings(Settings *settings)
+{
+    settings->setWindowSize(1280, 720);
+    settings->setFrameRate(60.0f);
+}
+
+void cindertestApp::setup()
+{
+    mFftAverageMode = fftQuadraticAverage;//fftLogarithmicAverage;
+    mBandCount = 512;
+    mInput = audio::Input();
+    mInput.start();
+    glLineWidth(2.0f);
+    gl::enableAdditiveBlending();
+	mSyphonServer.setName("Cinder Test");
+}
+
+void cindertestApp::mouseDown(MouseEvent event)
+{
+}
+
+void cindertestApp::update()
+{
+    mPcmBuffer = mInput.getPcmBuffer();
+    if (!mPcmBuffer) return;
+    
+    struct PcmChannels {
+        audio::Buffer32fRef left;
+        audio::Buffer32fRef right;
+    } pcm = {
+        mPcmBuffer->getChannelData(audio::CHANNEL_FRONT_LEFT),
+        mPcmBuffer->getChannelData(audio::CHANNEL_FRONT_RIGHT)
+    };
+
+    Channel32f waveformChannel(mPcmBuffer->getSampleCount(), mPcmBuffer->getChannelCount());
+    Channel32f::Iter chanIter = waveformChannel.getIter();
+    chanIter.line();
+    while (chanIter.pixel())
+    {
+        chanIter.v() = constrain(abs(pcm.left->mData[chanIter.x()]), 0.0f, 1.0f);
+    }
+    chanIter.line();
+    while (chanIter.pixel())
+    {
+        chanIter.v() = constrain(abs(pcm.right->mData[chanIter.x()]), 0.0f, 1.0f);
+    }
+    mWaveformTexture = gl::Texture(waveformChannel);
+    
+    mFftDataRef.left = audio::calculateFft(pcm.left, mBandCount);
+    mFftDataRef.right = audio::calculateFft(pcm.right, mBandCount);
+
+    switch (mFftAverageMode)
+	{
+	case fftQuadraticAverage:
+		quadraticFftAverage();
+		break;
+
+	case fftLogarithmicAverage:
+		logarithmicFftAverage();
+		break;
+
+	default:
+		break;
+    }
+}
+
+void cindertestApp::quadraticFftAverage()
+{
+    struct FftBandsChannels {
+        float *left;
+        float *right;
+    } bands = {
+        mFftDataRef.left.get(),
+        mFftDataRef.right.get()
+    };
+    if (!bands.left || !bands.right) return;
+    mAveragedFft.left.clear();
+    mAveragedFft.right.clear();
+    
+    // Inspired by:
+    // https://github.com/kineme/AudioTools/blob/master/AudioToolsFFT.m
+    
+    int lowerFrequency = 1, upperFrequency;
+    int k;
+    struct SumChannels {
+        float left;
+        float right;
+    } sum;
+    bool done = false;
+    int i = 0;
+    while (!done)
+    {
+        upperFrequency = lowerFrequency + i;
+        sum.left = 0.0f;
+        sum.right = 0.0f;
+        if (upperFrequency >= mBandCount/2 )
+        {
+            upperFrequency = mBandCount/2-1;
+            done = true;
+        }
+        for (k = lowerFrequency; k <= upperFrequency; ++k)
+        {
+            sum.left += bands.left[k];
+            sum.right += bands.right[k];
+        }
+        sum.left /= (float)(upperFrequency - lowerFrequency + 1);
+        sum.right /= (float)(upperFrequency - lowerFrequency + 1);
+        sum.left *= i * 2.0f + 1.0f;
+        sum.right *= i * 2.0f + 1.0f;
+        mAveragedFft.left.push_back(sum.left);
+        mAveragedFft.right.push_back(sum.right);
+        lowerFrequency = upperFrequency;
+        ++i;
+    }
+}
+
+void cindertestApp::logarithmicFftAverage()
+{
+    struct FftBandsChannels {
+        float *left;
+        float *right;
+    } bands = {
+        mFftDataRef.left.get(),
+        mFftDataRef.right.get()
+    };
+    if (!bands.left || !bands.right) return;
+    mAveragedFft.left.clear();
+    mAveragedFft.right.clear();
+    
+    // Inspired by:
+    // https://github.com/kineme/AudioTools/blob/master/AudioToolsFFT.m
+    
+    const float log2BandCount = log2f(mBandCount);
+    int numBuckets = log2BandCount;
+    int lowerFrequency, upperFrequency;
+    int k;
+    struct SumChannels {
+        float left;
+        float right;
+    } sum;
+    for (int i = 0; i < numBuckets; ++i)
+    {
+        lowerFrequency = (mBandCount/2) / powf(2.0f, log2BandCount-i  )+1;
+        upperFrequency = (mBandCount/2) / powf(2.0f, log2BandCount-i-1)+1;
+        sum.left = 0.0f;
+        sum.right = 0.0f;
+        if (upperFrequency >= mBandCount/2) upperFrequency = mBandCount/2-1;
+        for (k = lowerFrequency; k <= upperFrequency; ++k)
+        {
+            sum.left += bands.left[k];
+            sum.right += bands.right[k];
+        }
+        sum.left /= (float)(upperFrequency - lowerFrequency + 1);
+        sum.right /= (float)(upperFrequency - lowerFrequency + 1);
+        sum.left *= powf(i, 1.5f) + 1.0f;
+        sum.right *= powf(i, 1.5f) + 1.0f;
+        mAveragedFft.left.push_back(sum.left);
+        mAveragedFft.right.push_back(sum.right);
+    }
+}
+
+void cindertestApp::draw()
+{
+    if (!mWaveformTexture) return;
+    
+    mCam.setPerspective(90.0f, getWindowAspectRatio(), 0.1f, 300.0f);
+    mCam.lookAt(Vec3f(50.0f * sinf(getElapsedSeconds() * 0.2f),
+                      50.0f * sinf(getElapsedSeconds() * 0.125f),
+                      70.0f + 5.0f * cosf(getElapsedSeconds() * 0.125f)),
+                Vec3f(20.0f * sinf(getElapsedSeconds() * 0.2f),
+                      20.0f * sinf(getElapsedSeconds() * 0.125f),
+                      20.0f * cosf(getElapsedSeconds() * 0.3f)),
+                Vec3f::yAxis());
+    gl::setMatrices(mCam);
+    
+	// clear out the window with black
+	gl::clear( Color( 0, 0, 0 ), true );
+    mWaveformTexture.enableAndBind();
+    drawRing(0);
+    drawRing(1);
+	mSyphonServer.publishScreen();
+}
+
+void cindertestApp::drawRing(int channel)
+{
+    vector<float> data;
+    float incline, direction;
+    switch (channel)
+    {
+	case 0:
+		gl::color(0.2f, 0.1f, 0.8f, 0.25f);
+		data = mAveragedFft.left;
+		incline = 45.0f * sinf(getElapsedSeconds() * 0.15f);
+		direction = 1.0f;
+		break;
+            
+	case 1:
+		gl::color(0.8f, 0.2f, 0.6f, 0.25f);
+		data = mAveragedFft.right;
+		incline = -45.0f * sinf(getElapsedSeconds() * 0.15f);
+		direction = -1.0f;
+		break;
+            
+	default:
+		incline = 0.0f;
+		direction = 0.0f;
+		break;
+    }
+    
+    int bandCount = data.size();
+    if (!bandCount) return;
+    
+    const float scale = 1.0f / bandCount;
+    float rotOffs = getElapsedSeconds() * 10.0f * direction;
+
+    gl::pushMatrices();
+    gl::rotate(Vec3f(incline, rotOffs, 0.0f));
+    gl::enableWireframe();
+    gl::drawSphere(Vec3f::zero(), 5.0f);
+    gl::pushMatrices();
+    gl::translate(Vec2f(60.0f, 0.0f));
+    gl::rotate(Vec3f(0.0f, 0.0f, -90.0f));
+    gl::drawCylinder(2.0f, 0.0f, 2.5f);
+    gl::popMatrices();
+    gl::disableWireframe();
+    for (int i = 0; i < bandCount; ++i)
+    {
+        float h = data[i] * scale * 0.3f + 2.0f;
+        gl::drawCube(Vec3f(40.0f, 0.0f, 0.0f), Vec3f(25.0f + h, h, 1.5f));
+        gl::draw(mWaveformTexture, Rectf(10.0f, -2.0f - h * 0.5f, 35.0f, 2.0f + h * 0.5f));
+        gl::drawLine(Vec2f(5.0f, 0.0f), Vec2f(70.0f, 0.0f));
+        gl::enableWireframe();
+        gl::drawCube(Vec3f(40.0f, 0.0f, 0.0f), Vec3f(25.0f + h, h, 1.5f));
+        gl::disableWireframe();
+        gl::drawLine(Vec2f(60.0f, -4.0f), Vec2f(60.0f, 4.0f));
+        gl::rotate(Vec3f(0.0f, 360.0f * scale, 0.0f));
+    }
+    gl::popMatrices();
+}
+
+CINDER_APP_BASIC( cindertestApp, RendererGl(RendererGl::AA_MSAA_16) )
