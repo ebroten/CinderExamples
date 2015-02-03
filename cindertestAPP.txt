@@ -1,3 +1,4 @@
+//!This example is dependent on Syphon which is aparently a Mac OS X framework!
 #include "cinder/app/AppBasic.h"
 #include "cinder/Camera.h"
 #include "cinder/Channel.h"
